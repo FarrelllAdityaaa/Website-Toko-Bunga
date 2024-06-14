@@ -1,0 +1,230 @@
+#define BLYNK_TEMPLATE_ID "TMPL6GwK_7tv1"
+#define BLYNK_TEMPLATE_NAME "Penyiraman Cabai Otomatis"
+#define BLYNK_AUTH_TOKEN "dTqdQXI-TrYSL76BCjkhORAJsTGMecNV"
+
+#define BLYNK_PRINT Serial
+
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h> // Library LCD I2C
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <BlynkSimpleEsp32.h>
+#include <DHT.h>
+
+// Library untuk LCD I2C
+LiquidCrystal_I2C lcd(0x27, 16, 2); // Alamat I2C: 0x27, Jumlah kolom: 16, Jumlah baris: 2
+
+// Blynk credentials
+char auth[] = BLYNK_AUTH_TOKEN;
+char ssid[] = "LAPTOP-4IDAUTP9 7983";
+char pass[] = "123123123";
+
+// DHT11 setup
+#define DHTPIN 27         // Pin untuk sensor DHT11
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+// YL-69 setup
+#define SOIL_MOISTURE_PIN 34  // Pin untuk sensor kelembaban tanah YL-69
+
+// Relay setup
+#define RELAY_PIN 4  // Pin untuk relay yang mengontrol pompa air
+
+BlynkTimer timer;
+unsigned long lastWateringTime = 0;
+const unsigned long twoHours = 7200000; // 2 jam dalam milidetik
+
+enum WateringLevel { NO_WATERING, MEDIUM_WATERING, HIGH_WATERING };
+
+bool showSecondNotification = false;
+
+float fuzzyMembership(float value, float a, float b, float c, float d) {
+    if (value <= a || value >= d) return 0.0;
+    else if (value > a && value < b) return (value - a) / (b - a);
+    else if (value >= b && value <= c) return 1.0;
+    else if (value > c && value < d) return (d - value) / (d - c);
+    return 0.0;
+}
+
+float airTempNormal(float temp) { return fuzzyMembership(temp, 24, 26, 28, 30); }
+float soilMoistNormal(float moist) { return fuzzyMembership(moist, 60, 70, 80, 90); }
+
+void printFuzzyValues(float airTempNorm, float soilMoistNorm) {
+    Serial.print("Air Temperature Normality: ");
+    Serial.println(airTempNorm);
+    Serial.print("Soil Moisture Normality: ");
+    Serial.println(soilMoistNorm);
+    Serial.println();
+}
+
+WateringLevel determineWateringLevel(float airTemp, float soilMoist, String &reasonTemp, String &reasonMoist) {
+    float airTempNorm = airTempNormal(airTemp);
+    float soilMoistNorm = soilMoistNormal(soilMoist);
+
+    reasonTemp = (airTempNorm < 1.0) ? "Suhu Tidak Ideal" : "";
+    reasonMoist = (soilMoistNorm < 1.0) ? "Kelembaban Buruk" : "";
+
+    // Prioritaskan kelembaban
+    if (soilMoistNorm < 1.0) {
+        // Tentukan penyiraman sedang atau banyak berdasarkan jarak dari nilai ideal
+        if (soilMoistNorm < 0.5) {
+            return HIGH_WATERING; // Kelembaban jauh di luar batas ideal
+        } else {
+            return MEDIUM_WATERING; // Kelembaban sedikit di luar batas ideal
+        }
+    }
+
+    // Hanya periksa suhu jika kelembaban sudah ideal
+    if (airTempNorm < 1.0) {
+        if (airTempNorm < 0.5) {
+            return HIGH_WATERING; // Suhu jauh di luar batas ideal
+        } else {
+            return MEDIUM_WATERING; // Suhu sedikit di luar batas ideal
+        }
+    }
+
+    return NO_WATERING;
+}
+
+void displaySensorReadings(float airTemp, int soilMoist) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Suhu: ");
+    lcd.print(airTemp);
+    lcd.print("C");
+
+    lcd.setCursor(0, 1);
+    lcd.print("Kelembaban: ");
+    lcd.print(soilMoist);
+    lcd.print("%");
+}
+
+void setup() {
+    Serial.begin(115200);
+    Blynk.begin(auth, ssid, pass);
+    dht.begin();
+
+    // Inisialisasi LCD I2C
+    lcd.init();                      // Inisialisasi LCD
+    lcd.backlight();                 // Nyalakan backlight LCD
+
+    // Display loading message
+    lcd.setCursor(0, 0);
+    lcd.print("System loading,");
+    lcd.setCursor(0, 1);
+    lcd.print("please wait...");
+    delay(3000); // Display loading message for 3 seconds
+
+    // Initialize relay pin
+    pinMode(RELAY_PIN, OUTPUT);
+    digitalWrite(RELAY_PIN, HIGH); // Pastikan relay off pada awalnya (HIGH = mati, LOW = hidup)
+
+    timer.setInterval(2500L, sendSensor);
+}
+
+void loop() {
+    Blynk.run();
+    timer.run();
+}
+
+void sendSensor() {
+    // Baca nilai sensor
+    float airTemp = dht.readTemperature();
+    int soilMoist = analogRead(SOIL_MOISTURE_PIN);
+    soilMoist = map(soilMoist, 0, 4095, 0, 100);  // Konversi nilai ke persentase
+    soilMoist = (soilMoist - 100) * -1;
+
+    // Debugging: Print sensor values
+    Serial.print("Air Temperature: ");
+    Serial.println(airTemp);
+    Serial.print("Soil Moisture: ");
+    Serial.println(soilMoist);
+
+    String reasonTemp = "";
+    String reasonMoist = "";
+    WateringLevel level = determineWateringLevel(airTemp, soilMoist, reasonTemp, reasonMoist);
+
+    lcd.clear();
+
+    switch (level) {
+        case NO_WATERING:
+            displaySensorReadings(airTemp, soilMoist);
+            Serial.println("Tidak Menyiram");
+            Blynk.logEvent("no_watering", "No watering needed.");
+            Blynk.virtualWrite(V3, "Tidak Menyiram");
+            digitalWrite(RELAY_PIN, HIGH); 
+            break;
+
+        case MEDIUM_WATERING:
+        case HIGH_WATERING:
+            if (reasonTemp != "" && reasonMoist != "") {
+                for (int i = 0; i < 2; i++) {
+                    lcd.setCursor(0, 0);
+                    lcd.print("Suhu Tidak Ideal");
+                    lcd.setCursor(0, 1);
+                    lcd.print(level == HIGH_WATERING ? "Menyiram Banyak" : "Menyiram Sedang");
+                    delay(5000);
+                    lcd.clear();
+                    lcd.setCursor(0, 0);
+                    lcd.print("Kelembaban Buruk");
+                    lcd.setCursor(0, 1);
+                    lcd.print(level == HIGH_WATERING ? "Menyiram Banyak" : "Menyiram Sedang");
+                    delay(5000);
+                    lcd.clear();
+                }
+                lcd.setCursor(0, 0);
+                lcd.print("System sedang");
+                lcd.setCursor(0, 1);
+                lcd.print("menyiram");
+                Serial.println(level == HIGH_WATERING ? "Menyiram Banyak" : "Menyiram Sedang");
+                Blynk.logEvent(level == HIGH_WATERING ? "high_watering" : "medium_watering", level == HIGH_WATERING ? "High watering needed." : "Medium watering needed.");
+                Blynk.virtualWrite(V3, level == HIGH_WATERING ? "Menyiram Banyak" : "Menyiram Sedang");
+                digitalWrite(RELAY_PIN, LOW); 
+                delay(level == HIGH_WATERING ? 20000 : 10000); // Pompa air hidup selama 20 detik atau 10 detik
+                digitalWrite(RELAY_PIN, HIGH); 
+                displaySensorReadings(airTemp, soilMoist);
+            } else if (reasonTemp != "") {
+                lcd.setCursor(0, 0);
+                lcd.print("Suhu Tidak Ideal");
+                lcd.setCursor(0, 1);
+                lcd.print(level == HIGH_WATERING ? "Menyiram Banyak" : "Menyiram Sedang");
+                delay(5000);
+                lcd.clear();
+                if (millis() - lastWateringTime >= twoHours) {
+                    lcd.setCursor(0, 0);
+                    lcd.print("System sedang");
+                    lcd.setCursor(0, 1);
+                    lcd.print("menyiram");
+                    Serial.println(level == HIGH_WATERING ? "Menyiram Banyak" : "Menyiram Sedang");
+                    Blynk.logEvent(level == HIGH_WATERING ? "high_watering" : "medium_watering", level == HIGH_WATERING ? "High watering needed." : "Medium watering needed.");
+                    Blynk.virtualWrite(V3, level == HIGH_WATERING ? "Menyiram Banyak" : "Menyiram Sedang");
+                    digitalWrite(RELAY_PIN, LOW); 
+                    delay(level == HIGH_WATERING ? 20000 : 10000); // Pompa air hidup selama 20 detik atau 10 detik
+                    digitalWrite(RELAY_PIN, HIGH); 
+                    lastWateringTime = millis();
+                }
+                displaySensorReadings(airTemp, soilMoist);
+            } else if (reasonMoist != "") {
+                lcd.setCursor(0, 0);
+                lcd.print("Kelembaban Buruk");
+                lcd.setCursor(0, 1);
+                lcd.print(level == HIGH_WATERING ? "Menyiram Banyak" : "Menyiram Sedang");
+                delay(5000);
+                lcd.clear();
+                lcd.setCursor(0, 0);
+                lcd.print("System sedang");
+                lcd.setCursor(0, 1);
+                lcd.print("menyiram");
+                Serial.println(level == HIGH_WATERING ? "Menyiram Banyak" : "Menyiram Sedang");
+                Blynk.logEvent(level == HIGH_WATERING ? "high_watering" : "medium_watering", level == HIGH_WATERING ? "High watering needed." : "Medium watering needed.");
+                Blynk.virtualWrite(V3, level == HIGH_WATERING ? "Menyiram Banyak" : "Menyiram Sedang");
+                digitalWrite(RELAY_PIN, LOW); 
+                delay(level == HIGH_WATERING ? 20000 : 10000); // Pompa air hidup selama 20 detik atau 10 detik
+                digitalWrite(RELAY_PIN, HIGH); 
+                displaySensorReadings(airTemp, soilMoist);
+            }
+            break;
+    }
+
+    delay(500);  // Delay pendek untuk memberikan jeda setelah semua pesan telah ditampilkan
+}
